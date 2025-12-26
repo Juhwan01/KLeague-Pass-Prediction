@@ -1,0 +1,15 @@
+{
+  "best_value": 14.098617382879599,
+  "best_params": {
+    "num_gaussians": 2,
+    "hidden_dim": 512,
+    "lstm_layers": 2,
+    "dropout": 0.10091379297287364,
+    "lr": 0.002103612421918067,
+    "batch_size": 32,
+    "min_sigma": 0.01375713900174384,
+    "max_sigma": 0.2734590301181029,
+    "hybrid_loss_weight": 0.4252715620376822
+  },
+  "n_trials": 30
+}
