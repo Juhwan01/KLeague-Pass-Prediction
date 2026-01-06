@@ -1,0 +1,228 @@
+# ======================================================
+# [V16] 물리 엔진 + 전술 직관 분리 모델
+# ======================================================
+
+# NUM_TEAMS_ACTUAL이 정의되지 않은 경우 자동 계산
+if 'NUM_TEAMS_ACTUAL' not in globals():
+    if 'team_id_mapped' in train_df.columns:
+        NUM_TEAMS_ACTUAL = train_df['team_id_mapped'].max()
+    else:
+        NUM_TEAMS_ACTUAL = 12  # 기본값
+    print(f"⚠️ NUM_TEAMS_ACTUAL 자동 설정: {NUM_TEAMS_ACTUAL}")
+
+# Embedding 설정
+NGRAM_EMBED_DIM = 6  # 3-gram, 5-gram 임베딩 차원
+TEAM_EMBED_DIM = 4   # Team ID 임베딩 차원
+TACTICAL_DROPOUT = 0.3  # 전술 드롭아웃 30%
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.goal_attn = nn.Sequential(nn.Linear(3, 16), nn.ReLU(), nn.Linear(16, 1))
+        self.zone_attn = nn.Sequential(nn.Linear(3, 8), nn.ReLU(), nn.Linear(8, 1))
+        self.pos_attn = nn.Sequential(nn.Linear(2, 8), nn.ReLU(), nn.Linear(8, 1))
+        self.fusion = nn.Linear(3, 1)
+    def forward(self, x):
+        return self.fusion(torch.cat([self.pos_attn(x[..., 0:2]), 
+                                       self.goal_attn(x[..., 11:14]), 
+                                       self.zone_attn(x[..., 16:19])], dim=-1))
+
+
+class TemporalAttention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.pos_encoding = nn.Parameter(torch.randn(1, 100, hidden_dim) * 0.02)
+        self.temporal_attn = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), 
+                                           nn.Tanh(), nn.Dropout(0.1), 
+                                           nn.Linear(hidden_dim // 2, 1))
+    def forward(self, lstm_out):
+        return self.temporal_attn(lstm_out + self.pos_encoding[:, :lstm_out.size(1), :])
+
+
+class SpatialTemporalFusion(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.spatial_weight = nn.Parameter(torch.tensor(0.5))
+        self.temporal_weight = nn.Parameter(torch.tensor(0.5))
+        self.combine = nn.Sequential(nn.Linear(2, 8), nn.ReLU(), nn.Linear(8, 1), nn.Sigmoid())
+    def forward(self, s, t):
+        return (torch.sigmoid(self.spatial_weight) * s + 
+                torch.sigmoid(self.temporal_weight) * t) * self.combine(torch.cat([s, t], -1))
+
+
+class ImprovedMDNPredictor(nn.Module):
+    """
+    [V16] 물리 엔진 + 전술 직관 분리 모델
+    
+    🎯 핵심 구조:
+    1️⃣ 물리 엔진 (The Eye): LSTM - 순수 움직임만 학습
+    2️⃣ 전술 직관 (The Brain): Embeddings - N-gram + Team ID
+    3️⃣ 전술 드롭아웃: 30% 확률로 전술 정보 가리기
+    4️⃣ 최종 결합 (The Fusion): 물리 + 전술 → MDN
+    """
+    def __init__(self, input_dim, hidden_dim, num_layers, dropout, num_gaussians=2, 
+                 bidirectional=True, ngram3_vocab_size=22, ngram5_vocab_size=22,
+                 ngram_embed_dim=6, num_teams=12, team_embed_dim=4, tactical_dropout=0.3):
+        super().__init__()
+        self.num_gaussians = num_gaussians
+        self.tactical_dropout_rate = tactical_dropout
+        
+        # 2️⃣ 전술 직관: Embeddings (The Brain)
+        self.ngram3_embed = nn.Embedding(ngram3_vocab_size, ngram_embed_dim, padding_idx=0)
+        self.ngram5_embed = nn.Embedding(ngram5_vocab_size, ngram_embed_dim, padding_idx=0)
+        self.team_embed = nn.Embedding(num_teams + 1, team_embed_dim, padding_idx=0)
+        
+        # 1️⃣ 물리 엔진: LSTM (The Eye) - 순수 움직임만!
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True,
+                           dropout=dropout if num_layers > 1 else 0, bidirectional=bidirectional)
+        lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        
+        self.spatial_attn = SpatialAttention(lstm_output_dim)
+        self.temporal_attn = TemporalAttention(lstm_output_dim)
+        self.fusion = SpatialTemporalFusion(lstm_output_dim)
+        
+        # 4️⃣ 최종 결합: 물리 + 전술
+        final_dim = lstm_output_dim + ngram_embed_dim*2 + team_embed_dim
+        
+        # MDN Heads
+        self.pi_head = nn.Sequential(
+            nn.Linear(final_dim, final_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(final_dim // 2, num_gaussians)
+        )
+        self.mu_head = nn.Sequential(
+            nn.Linear(final_dim, final_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(final_dim // 2, num_gaussians * 2)
+        )
+        self.sigma_head = nn.Sequential(
+            nn.Linear(final_dim, final_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(final_dim // 2, num_gaussians * 2)
+        )
+        
+        nn.init.constant_(self.mu_head[-1].bias, 0.5)
+        nn.init.xavier_uniform_(self.mu_head[-1].weight, gain=0.1)
+
+    def forward(self, x, ngram3_idx, ngram5_idx, team_ids, mask=None, lengths=None):
+        batch_size, seq_len = x.size(0), x.size(1)
+        
+        # 3️⃣ 전술 드롭아웃 (Tactical Dropout) - 30% 확률로 가리기
+        if self.training:
+            # N-gram 드롭아웃
+            mask_3 = (torch.rand(batch_size, seq_len, device=x.device) < self.tactical_dropout_rate)
+            mask_5 = (torch.rand(batch_size, seq_len, device=x.device) < self.tactical_dropout_rate)
+            ngram3_idx = torch.where(mask_3, torch.zeros_like(ngram3_idx), ngram3_idx)
+            ngram5_idx = torch.where(mask_5, torch.zeros_like(ngram5_idx), ngram5_idx)
+            
+            # Team ID 드롭아웃
+            team_mask = (torch.rand(batch_size, device=x.device) < self.tactical_dropout_rate)
+            team_ids = torch.where(team_mask, torch.zeros_like(team_ids), team_ids)
+        
+        # 1️⃣ 물리 엔진 (The Eye) - LSTM으로 순수 움직임만 분석
+        if lengths is not None:
+            packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+            lstm_out, _ = self.lstm(packed)
+            lstm_out, _ = pad_packed_sequence(lstm_out, batch_first=True, total_length=seq_len)
+        else:
+            lstm_out, _ = self.lstm(x)
+        
+        # Attention으로 중요한 시점 가중합
+        fused_attn = self.fusion(self.spatial_attn(x), self.temporal_attn(lstm_out))
+        if mask is not None:
+            fused_attn = fused_attn.masked_fill(mask.unsqueeze(-1), float('-inf'))
+        final_attn = torch.softmax(fused_attn, dim=1)
+        
+        # 물리 엔진의 결론 (context)
+        physics_context = torch.sum(lstm_out * final_attn, dim=1)  # (batch, lstm_output_dim)
+        
+        # 2️⃣ 전술 직관 (The Brain) - Embeddings
+        ng3_emb = self.ngram3_embed(ngram3_idx)  # (batch, seq_len, embed_dim)
+        ng5_emb = self.ngram5_embed(ngram5_idx)
+        team_emb = self.team_embed(team_ids)  # (batch, team_embed_dim)
+        
+        # N-gram도 attention으로 가중합 (중요한 패턴만 추출)
+        # 🔧 FIX: final_attn은 이미 (batch, seq, 1)이므로 unsqueeze 불필요
+        ng3_context = torch.sum(ng3_emb * final_attn, dim=1)  # (batch, embed_dim)
+        ng5_context = torch.sum(ng5_emb * final_attn, dim=1)
+        
+        # 4️⃣ 최종 결합 (The Fusion): 물리 + 전술
+        # "물리적으로는 (50, 30)인데, 역습이고 서울FC니까 (55, 30)으로 조정"
+        final_features = torch.cat([physics_context, ng3_context, ng5_context, team_emb], dim=-1)
+        
+        # MDN 예측
+        pi = torch.softmax(self.pi_head(final_features), dim=1)
+        mu = torch.sigmoid(self.mu_head(final_features)).view(batch_size, self.num_gaussians, 2)
+        sigma_raw = self.sigma_head(final_features).view(batch_size, self.num_gaussians, 2)
+        sigma = torch.sigmoid(sigma_raw) * (MAX_SIGMA - MIN_SIGMA) + MIN_SIGMA
+        
+        return pi, mu, sigma
+
+
+def hybrid_mdn_loss(pi, mu, sigma, target, mse_weight=HYBRID_LOSS_WEIGHT):
+    """Hybrid Loss: NLL + MSE"""
+    batch_size = target.size(0)
+    target_expanded = target.unsqueeze(1).expand_as(mu)
+    
+    # NLL Loss
+    diff = target_expanded - mu
+    log_prob_components = (
+        -0.5 * math.log(2 * math.pi) - torch.log(sigma) - 0.5 * (diff / sigma) ** 2
+    )
+    log_prob = log_prob_components.sum(dim=2)
+    weighted_log_prob = log_prob + torch.log(pi + 1e-8)
+    nll_loss = -torch.logsumexp(weighted_log_prob, dim=1).mean()
+    
+    # MSE Loss
+    pred_mean = (pi.unsqueeze(-1) * mu).sum(dim=1)
+    mse_loss = nn.functional.mse_loss(pred_mean, target)
+    
+    total_loss = nll_loss + mse_weight * mse_loss
+    
+    return total_loss, nll_loss, mse_loss
+
+
+def mdn_predict_improved(pi, mu, sigma, strategy='mean'):
+    if strategy == 'mode':
+        max_idx = torch.argmax(pi, dim=1)
+        pred = mu[torch.arange(len(mu)), max_idx]
+    elif strategy == 'mean':
+        pred = (pi.unsqueeze(-1) * mu).sum(dim=1)
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+    
+    return torch.clamp(pred, 0.0, 1.0)
+
+
+# 모델 생성
+NGRAM3_VOCAB_SIZE = len(TOP_3GRAMS) + 2
+NGRAM5_VOCAB_SIZE = len(TOP_5GRAMS) + 2
+
+model = ImprovedMDNPredictor(
+    INPUT_DIM, HIDDEN_DIM, LSTM_LAYERS, DROPOUT, NUM_GAUSSIANS, 
+    BIDIRECTIONAL,
+    ngram3_vocab_size=NGRAM3_VOCAB_SIZE,
+    ngram5_vocab_size=NGRAM5_VOCAB_SIZE,
+    ngram_embed_dim=NGRAM_EMBED_DIM,
+    num_teams=NUM_TEAMS_ACTUAL,  # 🔧 실제 팀 개수 사용
+    team_embed_dim=TEAM_EMBED_DIM,
+    tactical_dropout=TACTICAL_DROPOUT
+).to(DEVICE)
+
+print("="*70)
+print("✅ [V16] 물리 엔진 + 전술 직관 분리 모델")
+print("="*70)
+print(f"🎯 핵심 구조:")
+print(f"  1️⃣ 물리 엔진 (LSTM): 순수 움직임만 학습")
+print(f"  2️⃣ 전술 직관 (Embeddings):")
+print(f"     - 3-gram: vocab {NGRAM3_VOCAB_SIZE}, dim {NGRAM_EMBED_DIM}")
+print(f"     - 5-gram: vocab {NGRAM5_VOCAB_SIZE}, dim {NGRAM_EMBED_DIM}")
+print(f"     - Team ID: vocab {NUM_TEAMS_ACTUAL+1}, dim {TEAM_EMBED_DIM}")
+print(f"  3️⃣ 전술 드롭아웃: {TACTICAL_DROPOUT*100:.0f}% (과적합 방지)")
+print(f"  4️⃣ Head Injection: LSTM 후 MDN 직전 결합")
+print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+print("="*70)
